@@ -1,0 +1,189 @@
+name: Sync main → gitops/pilot
+
+# Auto-syncs main into gitops/pilot on every push to main.
+#
+# Why this exists: gitops/pilot is the deploy branch ArgoCD reads from
+# (k8s/argocd/miserver-app.yaml). The only other writers there are image pins:
+# ArgoCD Image Updater (k8s/base/.argocd-source-miserver.yaml; the pre-P2 Application's pin
+# file was excluded too until 040 P7) and the nightly
+# owui-release-check workflow (k8s/open-webui/.argocd-source-open-webui.yaml). Without this workflow, manifest
+# changes on main would never reach the cluster.
+#
+# Strategy (same as the WASAT monorepo): merge main → gitops/pilot with
+# -X theirs, then hard-converge every tracked file to main's content EXCEPT
+# the Image-Updater-owned pin files, with push-retry against Image Updater
+# commit races.
+#
+# GATED ON PRIVATE CI (ENH-011 SV-1, #13, 2026-11-26). This used to run on every push with no
+# `needs:` and merge whatever `origin/main` was, so a manifest change reached ArgoCD while
+# Backend Tests was red. Now the `gate` job (a copy of sync-to-clean.yml's) runs
+# .github/scripts/private_ci_gate.py for the exact commit, and `sync` merges and converges to
+# EXACTLY `needs.gate.outputs.sha`, never `origin/main`. A push gates the pushed commit; a
+# manual dispatch gates main's head. "Never move gitops/pilot backwards" refuses a gated commit
+# older than a main commit gitops/pilot already holds. tests/unit/test_private_ci_trust.py §5
+# pins this from the parsed YAML and runs the sync's steps against a local origin.
+#
+# RESIDUAL (not closed by the gate): the gate closes the red-CI case only. It does NOT order
+# manifests after images: a manifest that names a new image can still reach the cluster before
+# the mirror has built that image (the image build runs on the mirror, after its own sync).
+#
+# Tracked debt: the push retry's `git pull --rebase` flattens the merge commit, so after a race
+# with Image Updater the merged main commits sit on gitops/pilot under new hashes. The
+# never-backwards check then cannot see them and compares against the last merge that kept
+# its hashes (it degrades to the older, still-correct reference; it never lets a backwards
+# converge through, because the converge itself is to the gated commit only).
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch: {}
+
+concurrency:
+  group: sync-main-to-gitops-pilot
+  cancel-in-progress: false
+
+# Least privilege (2026-10-17): read-only by default; the job that writes grants it below.
+permissions:
+  contents: read
+
+jobs:
+  # A copy of sync-to-clean.yml's `gate`: what may not reach the mirror may not reach the
+  # cluster either. The two REQUIRED_WORKFLOWS lists are pinned equal by the test.
+  gate:
+    name: Require private CI to have passed
+    if: github.repository == 'Onegaishimas/miServer'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      actions: read     # list this commit's workflow runs and their jobs
+      contents: read
+    outputs:
+      sha: ${{ steps.gate.outputs.sha }}
+    env:
+      REQUIRED_WORKFLOWS: |
+        backend-tests.yml
+        frontend-ci.yml
+    steps:
+      - name: Checkout source repository (full history, for the path-filter fallback)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # A push gates the pushed commit; a dispatch gates main's head, whatever ref started it.
+          ref: ${{ github.event_name == 'push' && github.sha || 'main' }}
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install the gate's one dependency
+        run: pip install pyyaml==6.0.3
+
+      - name: Name the commit to gate
+        id: target
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Require private CI to have passed for this commit
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.target.outputs.sha }}
+        run: python .github/scripts/private_ci_gate.py
+
+  sync:
+    needs: gate
+    permissions:
+      contents: write
+    # HARD STOP: only run in Onegaishimas/miServer (source repo)
+    if: github.repository == 'Onegaishimas/miServer'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout gitops/pilot
+        uses: actions/checkout@v4
+        with:
+          ref: gitops/pilot
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      # The gated commit must not be older than a main commit gitops/pilot already holds: a
+      # gate that finishes out of order (or a re-run of an old run) would otherwise converge the
+      # cluster's manifests back to older content. The counterpart of sync-to-clean.yml's
+      # "Never move the mirror backwards"; here it FAILS the run, so the refusal is seen.
+      - name: Never move gitops/pilot backwards
+        id: order
+        env:
+          SHA: ${{ needs.gate.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          # main commits after the gated one that gitops/pilot already contains.
+          NEWER="$(comm -12 <(git rev-list "${SHA}..HEAD" | sort) <(git rev-list "${SHA}..origin/main" | sort) | head -n1)"
+          if [ -n "$NEWER" ]; then
+            echo "::error::Refusing to move gitops/pilot backwards: it already holds main commit ${NEWER}, which is newer than the gated ${SHA}."
+            exit 1
+          fi
+          echo "${SHA} is not older than anything gitops/pilot holds."
+
+      - name: Skip if gitops/pilot already contains the gated commit
+        id: skip_check
+        env:
+          SHA: ${{ needs.gate.outputs.sha }}
+        run: |
+          if git merge-base --is-ancestor "$SHA" HEAD; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "gitops/pilot already contains ${SHA} — no merge needed"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge the gated commit with -X theirs (main is canonical for non-pin files)
+        if: steps.skip_check.outputs.skip != 'true'
+        env:
+          SHA: ${{ needs.gate.outputs.sha }}
+        run: |
+          git merge --no-ff --no-edit -X theirs "$SHA" || {
+            echo "::error::Merge failed despite -X theirs strategy"
+            git status
+            exit 1
+          }
+
+      - name: Converge non-pin files to the gated commit (kill gitops/pilot-only drift)
+        if: steps.skip_check.outputs.skip != 'true'
+        env:
+          SHA: ${{ needs.gate.outputs.sha }}
+        run: |
+          # main is the single source of truth for everything except the
+          # pin files the image pinners own. Hard-reset all tracked paths
+          # to the gated commit's exact content, excluding only those files.
+          git checkout "$SHA" -- . \
+            ':(exclude)k8s/base/.argocd-source-miserver.yaml' \
+            ':(exclude)k8s/open-webui/.argocd-source-open-webui.yaml'
+          if git diff --cached --quiet; then
+            echo "Already converged with main (no drift to drop)."
+          else
+            git --no-pager diff --cached --stat
+            git commit --no-edit -m "sync: converge non-pin files to main (drop gitops/pilot drift)"
+          fi
+
+      - name: Push with retry on race with Image Updater
+        if: steps.skip_check.outputs.skip != 'true'
+        run: |
+          for attempt in 1 2 3; do
+            if git push origin gitops/pilot; then
+              echo "Pushed successfully on attempt $attempt"
+              exit 0
+            fi
+            echo "Push attempt $attempt failed; fetching + rebasing"
+            git pull --rebase -X theirs origin gitops/pilot || {
+              echo "::error::Rebase failed during retry — needs operator attention"
+              exit 1
+            }
+          done
+          echo "::error::Push failed after 3 retries — needs operator attention"
+          exit 1

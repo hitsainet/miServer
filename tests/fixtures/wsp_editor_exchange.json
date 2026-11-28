@@ -1,0 +1,135 @@
+{
+  "source": {
+    "library": "weightspace",
+    "version": "0.3.0",
+    "file": "src/weightspace/llm/openai.py",
+    "functions": [
+      "to_openai_messages (:10-29)",
+      "to_openai_tools (:32-36)",
+      "OpenAIChat.complete (:124-151)"
+    ],
+    "read": "2026-11-15",
+    "note": "Hand-written from the sdist's source; the library was never installed or imported (043 D43-9, ID43-2). The OpenAI Python SDK merges extra_body into the top-level body, so the gateway's additions appear as top-level fields."
+  },
+  "headers": {
+    "X-miLLM-Origin": "judge",
+    "X-miLLM-Load-Policy": "refuse"
+  },
+  "body_added_by_gateway": {
+    "steering": {
+      "features": []
+    }
+  },
+  "client_extras": {
+    "ignored": [
+      "prompt_cache_key",
+      "reasoning_effort",
+      "service_tier"
+    ],
+    "honoured": [
+      "chat_template_kwargs"
+    ],
+    "note": "reasoning_effort is sent only when the client sets `thinking`, service_tier only with `speed`, chat_template_kwargs with thinking_style `chat_template`; all three are included as the worst case. logit_bias is never forwarded (it is refused)."
+  },
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "describe_tensor",
+        "description": "Summary statistics of one tensor",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "scale_tensor",
+        "description": "Multiply one tensor by a factor",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "factor": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "name",
+            "factor"
+          ]
+        }
+      }
+    }
+  ],
+  "system": "You edit a linear probe. Use the tools to inspect it, then propose one edit.",
+  "turns": [
+    {
+      "new_messages": [
+        {
+          "role": "user",
+          "content": "Inspect tensor `weight` and report its norm."
+        }
+      ],
+      "expect": {
+        "tool_calls": [
+          {
+            "name": "describe_tensor",
+            "arguments": {
+              "name": "weight"
+            }
+          }
+        ]
+      },
+      "tool_result": "shape (4096,), norm 5.21"
+    },
+    {
+      "new_messages": [],
+      "expect": {
+        "tool_calls": [
+          {
+            "name": "describe_tensor",
+            "arguments": {
+              "name": "bias"
+            }
+          }
+        ]
+      },
+      "tool_result": "shape (), value -0.13"
+    },
+    {
+      "new_messages": [],
+      "expect": {
+        "tool_calls": [
+          {
+            "name": "scale_tensor",
+            "arguments": {
+              "name": "weight",
+              "factor": 0.5
+            }
+          }
+        ]
+      },
+      "tool_result": "scaled"
+    }
+  ],
+  "client_fields": {
+    "reasoning_effort": "none",
+    "service_tier": "default",
+    "prompt_cache_key": "weightspace-run",
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    }
+  }
+}
